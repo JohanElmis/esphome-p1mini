@@ -1,12 +1,13 @@
 //-------------------------------------------------------------------------------------
 // ESPHome P1 Electricity Meter custom sensor
-// Copyright 2022 Johnny Johansson
+// Copyright 2022 Johnny Johansson, Erik Björk
 // Copyright 2020 Pär Svanström
 // 
 // History
 //  0.1.0 2020-11-05:   Initial release
 //  0.2.0 2022-04-13:   Major rewrite
 //  0.3.0 2022-04-23:   Passthrough to secondary P1 device
+//  0.4.0 2022-09-20:   Support binary format
 //
 // MIT License
 // Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), 
@@ -49,7 +50,7 @@ public:
 private:
     unsigned long m_minimum_period_ms{ 0 };
     unsigned long m_reading_message_time;
-    unsigned long m_reading_crc_time;
+    unsigned long m_verifying_crc_time;
     unsigned long m_processing_time;
     unsigned long m_resending_time;
     unsigned long m_waiting_time;
@@ -57,35 +58,37 @@ private:
     int m_num_message_loops;
     int m_num_processing_loops;
     bool m_display_time_stats{ false };
+    uint32_t obis_code{ 0x00 };
 
-    // Store the main message as it is beeing received:
+    // Store the message as it is being received:
     constexpr static int message_buffer_size{ 2048 };
     char m_message_buffer[message_buffer_size];
     int m_message_buffer_position{ 0 };
+    int m_crc_position{ 0 };
 
-    // Store the CRC part of the message as it is beeing received:
-    constexpr static int crc_buffer_size{ 8 };
-    char m_crc_buffer[crc_buffer_size];
-    int m_crc_buffer_position{ 0 };
-
-    // Calculate the CRC while the message is beeing received
-    uint16_t m_crc{ 0 };
-
-    // Keeps track of the start of the next line while processing.
-    char *m_start_of_line;
+    // Keeps track of the start of the data record while processing.
+    char *m_start_of_data;
 
     // Keeps track of bytes sent when resending the message
     int m_bytes_resent;
 
     enum class states {
         READING_MESSAGE,
-        READING_CRC,
-        PROCESSING,
+        VERIFYING_CRC,
+        PROCESSING_ASCII,
+        PROCESSING_BINARY,
         RESENDING, // To the optional secondary P1-port
         WAITING,
         ERROR_RECOVERY
     };
     enum states m_state { states::READING_MESSAGE };
+
+    enum class data_formats {
+        UNKNOWN,
+        ASCII,
+        BINARY
+    };
+    enum data_formats m_data_format{ data_formats::UNKNOWN };
 
     void ChangeState(enum states new_state)
     {
@@ -96,16 +99,16 @@ private:
             m_num_message_loops = m_num_processing_loops = 0;
             m_CTS_switch->turn_on();
             if (m_status_switch != nullptr) m_status_switch->turn_on();
-            m_crc = m_message_buffer_position = 0;
+            m_crc_position = m_message_buffer_position = 0;
             break;
-        case states::READING_CRC:
-            m_reading_crc_time = current_time;
-            m_crc_buffer_position = 0;
-            break;
-        case states::PROCESSING:
-            m_processing_time = current_time;
+        case states::VERIFYING_CRC:
+            m_verifying_crc_time = current_time;
             m_CTS_switch->turn_off();
-            m_start_of_line = m_message_buffer;
+            break;
+        case states::PROCESSING_ASCII:
+        case states::PROCESSING_BINARY:
+            m_processing_time = current_time;
+            m_start_of_data = m_message_buffer;
             break;
         case states::RESENDING:
             m_resending_time = current_time;
@@ -169,70 +172,122 @@ public:
         m_minimum_period_ms = static_cast<unsigned long>(m_update_period_number->state * 1000.0f + 0.5f);
         switch (m_state) {
         case states::READING_MESSAGE:
-        case states::READING_CRC:
             ++m_num_message_loops;
             while (available()) {
                 // While data is available, read it one byte at a time.
                 char const read_byte{ (char)read() };
-                if (m_state == states::READING_MESSAGE) {
-                    crc16_update(read_byte);
-                    if (read_byte == '!') {
-                        // The exclamation mark indicates that the main message is complete
-                        // and the CRC will come next.
-                        m_message_buffer[m_message_buffer_position] = '\0';
-                        ChangeState(states::READING_CRC);
-                    }
-                    else {
-                        m_message_buffer[m_message_buffer_position++] = read_byte;
-                        if (m_message_buffer_position == message_buffer_size) {
-                            ESP_LOGW("p1reader", "Message buffer overrun. Resetting.");
-                            ChangeState(states::ERROR_RECOVERY);
-                            return;
-                        }
+
+                // First byte tells which data format
+                if (m_message_buffer_position == 0) {
+                    if (read_byte == '/') {
+                        ESP_LOGD("p1reader", "ASCII data format");
+                        m_data_format = data_formats::ASCII;
+                    } else if (read_byte == 0x7e) {
+                        ESP_LOGD("p1reader", "BINARY data format");
+                        m_data_format = data_formats::BINARY;
+                    } else {
+                        ESP_LOGW("p1reader", "Unknown data format (0x%02X). Resetting.", read_byte);
+                        ChangeState(states::ERROR_RECOVERY);
+                        return;
                     }
                 }
-                else { // READING_CRC
-                    if (read_byte == '\n') {
-                        // The CRC is a single line, so once we reach end of line, we are
-                        // ready to verify and process the message.
-                        m_crc_buffer[m_crc_buffer_position] = '\0';
-                        int const crcFromMsg = (int)strtol(m_crc_buffer, NULL, 16);
-                        if (m_crc != crcFromMsg) {
-                            ESP_LOGW("p1reader", "CRC missmatch, calculated %04X != %04X. Message ignored.", m_crc, crcFromMsg);
-                            ESP_LOGD("p1reader", "Buffer:\n%s", m_message_buffer);
-                            ChangeState(states::ERROR_RECOVERY);
-                            return;
-                        }
-                        else {
-                            ChangeState(states::PROCESSING);
-                            return;
-                        }
+
+                m_message_buffer[m_message_buffer_position++] = read_byte;
+                if (m_message_buffer_position == message_buffer_size) {
+                    ESP_LOGW("p1reader", "Message buffer overrun. Resetting.");
+                    ChangeState(states::ERROR_RECOVERY);
+                    return;
+                }
+
+                // Find out where CRC will be positioned
+                if (m_data_format == data_formats::ASCII && read_byte == '!') {
+                    // The exclamation mark indicates that the main message is complete
+                    // and the CRC will come next.
+                    m_crc_position = m_message_buffer_position;
+                } else if (m_data_format == data_formats::BINARY && m_message_buffer_position == 3) {
+                    if ((0xe0 & m_message_buffer[1]) != 0xa0) {
+                        ESP_LOGW("p1reader", "Unknown frame format (0x%02X). Resetting.", read_byte);
+                        ChangeState(states::ERROR_RECOVERY);
+                        return;
                     }
-                    else {
-                        m_crc_buffer[m_crc_buffer_position++] = read_byte;
-                        if (m_crc_buffer_position == crc_buffer_size) {
-                            ESP_LOGW("p1reader", "CRC buffer overrun. Resetting.");
+                    m_crc_position = ((0x1f & m_message_buffer[1]) << 8) + m_message_buffer[2] - 1;
+                }
+
+                // If end of CRC is reached, start verifying CRC
+                if (m_crc_position > 0 && m_message_buffer_position > m_crc_position) {
+                    if (m_data_format == data_formats::ASCII && read_byte == '\n') {
+                        ChangeState(states::VERIFYING_CRC);
+                    } else if (m_data_format == data_formats::BINARY && m_message_buffer_position == m_crc_position + 3) {
+                        if (read_byte != 0x7e) {
+                            ESP_LOGW("p1reader", "Unexpected end. Resetting.");
                             ChangeState(states::ERROR_RECOVERY);
                             return;
                         }
+                        ChangeState(states::VERIFYING_CRC);
                     }
                 }
             }
             break;
-        case states::PROCESSING:
+        case states::VERIFYING_CRC: {
+            int crc_from_msg = -1;
+            int crc = 0;
+
+            if (m_data_format == data_formats::ASCII) {
+                crc_from_msg = (int) strtol(m_message_buffer + m_crc_position, NULL, 16);
+                crc = crc16_ccitt_false(m_message_buffer, m_crc_position);
+            } else if (m_data_format == data_formats::BINARY) {
+                crc_from_msg = (m_message_buffer[m_crc_position + 1] << 8) + m_message_buffer[m_crc_position];
+                crc = crc16_x25(&m_message_buffer[1], m_crc_position - 1);
+            }
+
+            if (crc == crc_from_msg) {
+                ESP_LOGD("p1reader", "CRC verification OK");
+                if (m_data_format == data_formats::ASCII) {
+                    ChangeState(states::PROCESSING_ASCII);
+                } else if (m_data_format == data_formats::BINARY) {
+                    ChangeState(states::PROCESSING_BINARY);
+                } else {
+                    ChangeState(states::ERROR_RECOVERY);
+                }
+                return;
+            }
+
+            // CRC verification failed
+            ESP_LOGW("p1reader", "CRC mismatch, calculated %04X != %04X. Message ignored.", crc, crc_from_msg);
+            if (m_data_format == data_formats::ASCII) {
+                ESP_LOGD("p1reader", "Buffer:\n%s (%d)", m_message_buffer, m_message_buffer_position);
+            } else if (m_data_format == data_formats::BINARY) {
+                ESP_LOGD("p1reader", "Buffer:");
+                char hex_buffer[81];
+                hex_buffer[80] = '\0';
+                for (int i = 0; i * 40 < m_message_buffer_position; i++) {
+                    int j;
+                    for (j = 0; j + i * 40 < m_message_buffer_position && j < 40; j++) {
+                        sprintf(&hex_buffer[2*j], "%02X", m_message_buffer[j + i*40]);
+                    }
+                    if (j >= m_message_buffer_position) {
+                        hex_buffer[j] = '\0';
+                    }
+                    ESP_LOGD("p1reader", "%s", hex_buffer);
+                }
+            }
+            ChangeState(states::ERROR_RECOVERY);
+            return;
+        }
+        case states::PROCESSING_ASCII:
             ++m_num_processing_loops;
             do {
-                while (*m_start_of_line == '\n' || *m_start_of_line == '\r') ++m_start_of_line;
-                char *end_of_line{ m_start_of_line };
-                while (*end_of_line != '\n' && *end_of_line != '\r' && *end_of_line != '\0') ++end_of_line;
+                while (*m_start_of_data == '\n' || *m_start_of_data == '\r') ++m_start_of_data;
+                char *end_of_line{ m_start_of_data };
+                while (*end_of_line != '\n' && *end_of_line != '\r' && *end_of_line != '\0' && *end_of_line != '!') ++end_of_line;
                 char const end_of_line_char{ *end_of_line };
                 *end_of_line = '\0';
 
-                if (end_of_line != m_start_of_line) {
+                if (end_of_line != m_start_of_data) {
                     int minor{ -1 }, major{ -1 }, micro{ -1 };
                     double value{ -1.0 };
-                    if (sscanf(m_start_of_line, "1-0:%d.%d.%d(%lf", &major, &minor, &micro, &value) != 4) {
-                        ESP_LOGD("p1reader", "Could not parse value from line '%s'", m_start_of_line);
+                    if (sscanf(m_start_of_data, "1-0:%d.%d.%d(%lf", &major, &minor, &micro, &value) != 4) {
+                        ESP_LOGD("p1reader", "Could not parse value from line '%s'", m_start_of_data);
                     }
                     else {
                         uint32_t const obisCode{ OBIS(major, minor, micro) };
@@ -244,13 +299,97 @@ public:
                     }
                 }
                 *end_of_line = end_of_line_char;
-                if (end_of_line_char == '\0') {
+                if (end_of_line_char == '\0' || end_of_line_char == '!') {
                     ChangeState(states::RESENDING);
                     return;
                 }
-                m_start_of_line = end_of_line + 1;
+                m_start_of_data = end_of_line + 1;
             } while (millis() - loop_start_time < 25);
             break;
+        case states::PROCESSING_BINARY: {
+            ++m_num_processing_loops;
+            if (m_start_of_data == m_message_buffer) {
+                m_start_of_data += 3;
+                while (*m_start_of_data != 0x13 && m_start_of_data <= m_message_buffer + m_crc_position) ++m_start_of_data;
+                if (m_start_of_data > m_message_buffer + m_crc_position) {
+                    ESP_LOGW("p1reader", "Could not find control byte. Resetting.");
+                    ChangeState(states::ERROR_RECOVERY);
+                    return;
+                }
+                m_start_of_data += 6;
+            }
+
+            do {
+                uint8_t type  = *m_start_of_data;
+                switch (type) {
+                case 0x00:
+                    m_start_of_data++;
+                    break;
+                case 0x01: // array
+                    m_start_of_data += 2;
+                    break;
+                case 0x02: // struct
+                    m_start_of_data += 2;
+                    break;
+                case 0x06: {// unsigned double long
+                    uint32_t v = (*(m_start_of_data + 1) << 24 | *(m_start_of_data + 2) << 16 | *(m_start_of_data + 3) << 8 | *(m_start_of_data + 4));
+                    float fv = v * 1.0 / 1000;
+                    Sensor *S{ GetSensor(obis_code) };
+                    if (S != nullptr) S->publish_state(fv);
+                    m_start_of_data += 1 + 4;
+                    break;
+                }
+                case 0x09: // octet
+                    if (*(m_start_of_data + 1) == 0x06) {
+                        int minor{ -1 }, major{ -1 }, micro{ -1 };
+                        major = *(m_start_of_data + 4);
+                        minor = *(m_start_of_data + 5);
+                        micro = *(m_start_of_data + 6);
+
+                        obis_code = OBIS(major, minor, micro);
+                    }
+                    m_start_of_data += 2 + (int) *(m_start_of_data + 1);
+                    break;
+                case 0x0a: // string
+                    m_start_of_data += 2 + (int) *(m_start_of_data + 1);
+                    break;
+                case 0x0c: // datetime
+                    m_start_of_data += 13;
+                    break;
+                case 0x0f: // scalar
+                    m_start_of_data += 2;
+                    break;
+                case 0x10: {// unsigned long
+                    uint16_t v = (*(m_start_of_data + 1) << 8 | *(m_start_of_data + 2));
+                    float fv = v * 1.0 / 10;
+                    Sensor *S{ GetSensor(obis_code) };
+                    if (S != nullptr) S->publish_state(fv);
+                    m_start_of_data += 3;
+                    break;
+                }
+                case 0x12: {// signed long
+                    int16_t v = (*(m_start_of_data + 1) << 8 | *(m_start_of_data + 2));
+                    float fv = v * 1.0 / 10;
+                    Sensor *S{ GetSensor(obis_code) };
+                    if (S != nullptr) S->publish_state(fv);
+                    m_start_of_data += 3;
+                    break;
+                }
+                case 0x16: // enum
+                    m_start_of_data += 2;
+                    break;
+                default:
+                    ESP_LOGW("p1reader", "Unsupported data type 0x%02x. Resetting.", type);
+                    ChangeState(states::ERROR_RECOVERY);
+                    return;
+                }
+                if (m_start_of_data >= m_message_buffer + m_crc_position) {
+                    ChangeState(states::RESENDING);
+                    return;
+                }
+            } while (millis() - loop_start_time < 25);
+            break;
+        }
         case states::RESENDING:
             if (m_bytes_resent < m_message_buffer_position) {
                 int max_bytes_to_send{ 200 };
@@ -259,10 +398,6 @@ public:
                 } while (m_bytes_resent < m_message_buffer_position && max_bytes_to_send-- != 0);
             }
             else {
-                write('!');
-                char const *crc_pos{ m_crc_buffer };
-                while (*crc_pos != '\0') write(*crc_pos++);
-                write('\n');
                 ChangeState(states::WAITING);
             }
             break;
@@ -292,17 +427,26 @@ public:
     }
 
 private:
-    void crc16_update(uint8_t a) {
+    uint16_t crc16_ccitt_false(char* pData, int length) {
         int i;
-        m_crc ^= a;
-        for (i = 0; i < 8; ++i) {
-            if (m_crc & 1) {
-                m_crc = (m_crc >> 1) ^ 0xA001;
-            }
-            else {
-                m_crc = (m_crc >> 1);
-            }
+        uint16_t wCrc = 0;
+        while (length--) {
+            wCrc ^= *(unsigned char *)pData++;
+            for (i=0; i < 8; i++)
+                wCrc = wCrc & 0x0001 ? (wCrc >> 1) ^ 0xA001 : wCrc >> 1;
         }
+        return wCrc;
+    }
+
+    uint16_t crc16_x25(char* pData, int length) {
+        int i;
+        uint16_t wCrc = 0xffff;
+        while (length--) {
+            wCrc ^= *(unsigned char *)pData++ << 0;
+            for (i=0; i < 8; i++)
+                wCrc = wCrc & 0x0001 ? (wCrc >> 1) ^ 0x8408 : wCrc >> 1;
+        }
+        return wCrc ^ 0xffff;
     }
 
 
