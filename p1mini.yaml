@@ -28,7 +28,8 @@ logger:
 
 # Enable Home Assistant API
 api:
-  password: "${device_password}"
+  encryption:
+    key: !secret api_encr_b64key
 
 ota:
   password: "${device_password}"
@@ -39,6 +40,8 @@ web_server:
 #  auth:
 #    username: admin
 #    password: "${device_password}"
+
+prometheus:
 
 text_sensor:
 # Reports the ESPHome Version with compile date
